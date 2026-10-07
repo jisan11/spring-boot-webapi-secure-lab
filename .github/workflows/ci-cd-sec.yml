@@ -1,0 +1,206 @@
+name: CI/CD - Spring Boot DevSecOps
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: '25'
+  MAVEN_OPTS: '-Xmx2g'
+
+jobs:
+
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build & run tests with coverage
+        run: |
+          mvn -B clean verify \
+            -DskipITs=false \
+            org.jacoco:jacoco-maven-plugin:prepare-agent \
+            org.jacoco:jacoco-maven-plugin:report
+
+      - name: Upload test & coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-and-coverage-reports
+          path: |
+            target/surefire-reports/
+            target/site/jacoco/
+            target/failsafe-reports/
+          if-no-files-found: warn
+          retention-days: 7
+
+
+  sast-codeql:
+    name: SAST - CodeQL
+    runs-on: ubuntu-latest
+
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java
+          queries: security-and-quality
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:java"
+
+
+  sca-dependency-check:
+    name: SCA - OWASP Dependency-Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run OWASP Dependency-Check
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          mvn -B org.owasp:dependency-check-maven:13.0.0:check \
+            -DnvdApiKeyEnvironmentVariable=NVD_API_KEY \
+            -DfailBuildOnCVSS=9
+
+      - name: Upload Dependency-Check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: target/dependency-check-report.html
+          if-no-files-found: warn
+          retention-days: 14
+
+
+  static-analysis:
+    name: Static Analysis (SpotBugs + PMD)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run SpotBugs & PMD
+        run: |
+          mvn -B clean compile \
+            com.github.spotbugs:spotbugs-maven-plugin:4.9.7.0:check \
+            org.apache.maven.plugins:maven-pmd-plugin:check || true
+
+      - name: Upload SpotBugs / PMD reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-analysis-reports
+          path: |
+            target/spotbugsXml.xml
+            target/pmd.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+
+    needs:
+      - build-and-test
+      - sast-codeql
+      - sca-dependency-check
+      - static-analysis
+
+    if: always()
+
+    steps:
+      - name: Check previous job results
+        run: |
+          echo "========================================"
+          echo "           QUALITY GATE"
+          echo "========================================"
+
+          echo "Build & Test: ${{ needs.build-and-test.result }}"
+          echo "CodeQL:       ${{ needs.sast-codeql.result }}"
+          echo "SCA:          ${{ needs.sca-dependency-check.result }}"
+          echo "SpotBugs/PMD: ${{ needs.static-analysis.result }}"
+
+          if [[ "${{ needs.build-and-test.result }}" != "success" ]]; then
+            echo "::error::Build or tests failed"
+            exit 1
+          fi
+
+          if [[ "${{ needs.sast-codeql.result }}" != "success" ]]; then
+            echo "::error::CodeQL analysis failed"
+            exit 1
+          fi
+
+          if [[ "${{ needs.sca-dependency-check.result }}" != "success" ]]; then
+            echo "::error::Dependency-Check detected critical vulnerabilities"
+            exit 1
+          fi
+
+          if [[ "${{ needs.static-analysis.result }}" != "success" ]]; then
+            echo "::error::Static analysis failed"
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "       QUALITY GATE PASSED"
+          echo "========================================"
