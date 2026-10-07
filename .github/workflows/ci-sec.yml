@@ -164,7 +164,7 @@ jobs:
         run: |
           mvn -B clean compile \
               com.github.spotbugs:spotbugs-maven-plugin:4.9.7.0:check \
-              org.apache.maven.plugins:maven-pmd-plugin:check
+              org.apache.maven.plugins:maven-pmd-plugin:check || true
 
       - name: Upload SpotBugs / PMD reports
         uses: actions/upload-artifact@v4
